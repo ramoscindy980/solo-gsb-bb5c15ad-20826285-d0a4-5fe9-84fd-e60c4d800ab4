@@ -20,6 +20,12 @@ const state = {
     makeupPreview: null, // 当前场次的漏项补排预览（可补排的漏执行记录）
     cmp: { baseId: null, compareId: null, result: null, expanded: new Set() }, // 场次对照
   },
+  versions: {
+    list: [], // 历史版本摘要（不含正文）
+    selected: null, // 当前查看的版本（含正文）
+    preview: null, // 该版本的恢复预览（已绑定/待确认数量与待确认明细）
+    busy: false,
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -191,6 +197,7 @@ async function openScript(id) {
     makeupPreview: null,
     cmp: { baseId: null, compareId: null, result: null, expanded: new Set() },
   };
+  state.versions = { list: [], selected: null, preview: null, busy: false };
   $('detailTitle').textContent = state.script.title;
   $('topbarSub').textContent = state.script.title;
   $('scriptEditor').value = state.script.content;
@@ -707,13 +714,17 @@ function switchTab(tab) {
   state.tab = tab;
   $('cueTab').classList.toggle('hidden', tab !== 'cue');
   $('runTab').classList.toggle('hidden', tab !== 'run');
+  $('versionsTab').classList.toggle('hidden', tab !== 'versions');
   $('tabCueBtn').classList.toggle('active', tab === 'cue');
   $('tabRunBtn').classList.toggle('active', tab === 'run');
+  $('tabVersionsBtn').classList.toggle('active', tab === 'versions');
   if (tab === 'run') loadRunTab();
+  if (tab === 'versions') loadVersionsTab();
 }
 
 $('tabCueBtn').addEventListener('click', () => switchTab('cue'));
 $('tabRunBtn').addEventListener('click', () => switchTab('run'));
+$('tabVersionsBtn').addEventListener('click', () => switchTab('versions'));
 
 /* =============================== 排练执行台 =============================== */
 
@@ -1594,6 +1605,255 @@ $('cmpResult').addEventListener('click', (e) => {
   if (expanded.has(idx)) expanded.delete(idx);
   else expanded.add(idx);
   renderCompare();
+});
+
+/* =============================== 剧本版本回溯 =============================== */
+
+async function loadVersionsTab() {
+  try {
+    const data = await api('GET', `/api/scripts/${state.script.id}/versions`);
+    state.versions.list = data.versions || [];
+    renderVersionList();
+    renderVersionSelection();
+    renderRestorePanel();
+  } catch (err) {
+    $('versionList').innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+  }
+}
+
+function renderVersionList() {
+  const box = $('versionList');
+  const list = state.versions.list;
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">还没有任何版本快照。</div>';
+    return;
+  }
+  box.innerHTML = list
+    .map((v) => {
+      const active = state.versions.selected && state.versions.selected.version === v.version;
+      return `
+      <div class="version-item ${v.is_current ? 'is-current' : ''} ${active ? 'active' : ''}"
+           data-version="${v.version}">
+        <div class="version-item-top">
+          <span class="version-item-name">第 ${v.version} 版</span>
+          ${v.is_current ? '<span class="badge badge-ok">当前版本</span>' : ''}
+          ${active && !v.is_current ? '<span class="badge badge-version">查看中</span>' : ''}
+        </div>
+        <div class="version-item-meta">保存于 ${escapeHtml(v.created_at)} · ${v.line_count} 行</div>
+      </div>`;
+    })
+    .join('');
+}
+
+$('versionList').addEventListener('click', (e) => {
+  const item = e.target.closest('.version-item');
+  if (item) selectVersion(Number(item.dataset.version));
+});
+
+/** 点开某版本：拉取该版正文并清空之前的恢复预览（防止把旧预览误用到其他版本上） */
+async function selectVersion(version) {
+  try {
+    const detail = await api(
+      'GET',
+      `/api/scripts/${state.script.id}/versions/${version}`
+    );
+    state.versions.selected = detail;
+    state.versions.preview = null;
+    renderVersionList();
+    renderVersionSelection();
+    renderRestorePanel();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** 右侧正文区渲染（只读；复用通用剧本行渲染，不可点击） */
+function renderVersionSelection() {
+  const v = state.versions.selected;
+  if (!v) {
+    $('versionViewerTitle').textContent = '版本正文';
+    $('versionViewerMeta').textContent = '';
+    $('versionContent').innerHTML =
+      '<div class="empty">点击左侧任一历史版本查看该版正文。</div>';
+    return;
+  }
+  $('versionViewerTitle').textContent = `第 ${v.version} 版正文`;
+  $('versionViewerMeta').textContent = `保存于 ${v.created_at}${
+    v.is_current ? ' · 当前版本' : ''
+  }`;
+  renderViewer($('versionContent'), v.content, { clickable: false });
+  // 历史正文只读：去掉行 hover 指针感（无 selectable 类即不可点，点击区也不会触发添加提示）
+}
+
+function renderRestorePanel() {
+  const box = $('restoreBox');
+  const v = state.versions.selected;
+  if (!v || v.is_current) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  box.classList.remove('hidden');
+  const p = state.versions.preview;
+
+  if (!p) {
+    box.innerHTML = `
+      <div class="restore-head">
+        <strong>🕘 恢复到第 ${v.version} 版</strong>
+      </div>
+      <p class="hint" style="margin:6px 0">
+        恢复不会覆盖或删除任何历史快照：该版正文会被<strong>另存为递增的新版本</strong>，
+        当前提示则在同一事务内按既有重定位规则迁移；无法唯一定位的台词仍会保持待确认并给出候选行。
+        提交时会校验预览时的当前版本号，若另一窗口已改版将返回冲突、要求重新预览。
+      </p>
+      <div class="restore-actions">
+        <button class="btn btn-primary" id="restorePreviewBtn">预览提示迁移结果</button>
+      </div>`;
+    return;
+  }
+
+  // 预览只在「基于同一当前版本、且针对同一目标版本」时有效
+  const stale =
+    p.current_version !== state.script.current_version || p.target_version !== v.version;
+  const pendingList = (p.pending_cues || [])
+    .map(
+      (c) => `
+    <div class="pending-item">
+      <div class="pending-item-top">
+        <span class="badge ${c.type === 'light' ? 'badge-light' : 'badge-sound'}">
+          ${c.type === 'light' ? '💡 灯光' : '🔊 音效'}
+        </span>
+        <strong>${escapeHtml(c.label)}</strong>
+        <span class="badge badge-pending">待确认</span>
+      </div>
+      <div class="cue-line">原锚点台词：${escapeHtml(c.anchor_text || '（无）')}</div>
+      <div class="pending-reason">${escapeHtml(c.issue_detail || '无法定位')}</div>
+      ${
+        c.candidates && c.candidates.length
+          ? `<div class="hint" style="margin:6px 0 2px">候选行：第 ${c.candidates
+              .map((x) => x.lineNo)
+              .join('、')} 行</div>` +
+            c.candidates
+              .map(
+                (x) => `
+            <div class="candidate-row">
+              <span class="badge badge-pending">第 ${x.lineNo} 行</span>
+              <span class="candidate-line">${escapeHtml(x.lineText)}</span>
+            </div>`
+              )
+              .join('')
+          : ''
+      }
+    </div>`
+    )
+    .join('');
+
+  box.innerHTML = `
+    <div class="restore-head">
+      <strong>🕘 恢复到第 ${v.version} 版 · 迁移预览</strong>
+      <span class="hint">基于当前第 ${p.current_version} 版的提示演算</span>
+    </div>
+    <div class="restore-stats">
+      <span>提示总数 <strong>${p.total}</strong></span>
+      <span style="color:var(--ok)">将自动绑定 <strong>${p.bound}</strong></span>
+      <span style="color:${p.pending ? 'var(--danger)' : 'var(--text-dim)'}">
+        待确认 <strong>${p.pending}</strong>
+      </span>
+    </div>
+    ${
+      p.pending > 0
+        ? `<p class="hint" style="margin:6px 0">以下提示迁移后仍无法唯一定位，将保持待确认，恢复后可在提示单中人工重绑：</p>
+           <div class="restore-pending-list">${pendingList}</div>`
+        : '<p class="hint" style="margin:6px 0">全部提示都能在该版正文中唯一定位。</p>'
+    }
+    ${
+      stale
+        ? `<p class="restore-stale">⚠ 预览已过期（当前版本或目标版本已变化），请重新预览后再恢复。</p>`
+        : ''
+    }
+    <div class="restore-actions">
+      <button class="btn btn-primary" id="restoreConfirmBtn" ${stale ? 'disabled' : ''}>
+        确认恢复（另存为新版本）
+      </button>
+      <button class="btn" id="restoreRepreviewBtn">重新预览</button>
+    </div>`;
+}
+
+$('restoreBox').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const vs = state.versions;
+  if (!vs.selected || vs.busy) return;
+
+  if (btn.id === 'restorePreviewBtn' || btn.id === 'restoreRepreviewBtn') {
+    vs.busy = true;
+    btn.disabled = true;
+    try {
+      vs.preview = await api(
+        'GET',
+        `/api/scripts/${state.script.id}/versions/${vs.selected.version}/restore-preview`
+      );
+      renderRestorePanel();
+    } catch (err) {
+      toast(err.message, true);
+      btn.disabled = false;
+    } finally {
+      vs.busy = false;
+    }
+    return;
+  }
+
+  if (btn.id === 'restoreConfirmBtn') {
+    const p = vs.preview;
+    if (!p) return;
+    if (p.target_version !== vs.selected.version) return;
+    if (p.current_version !== state.script.current_version) {
+      toast('预览已过期，请重新预览', true);
+      renderRestorePanel();
+      return;
+    }
+    if (
+      !confirm(
+        `将把第 ${vs.selected.version} 版正文另存为递增的新版本，当前第 ${p.current_version} 版及全部历史快照都会保留。\n\n` +
+          `提示迁移预览：自动绑定 ${p.bound} 条，待确认 ${p.pending} 条（共 ${p.total} 条）。\n\n确认恢复？`
+      )
+    ) {
+      return;
+    }
+    vs.busy = true;
+    btn.disabled = true;
+    try {
+      const r = await api(
+        'POST',
+        `/api/scripts/${state.script.id}/versions/${vs.selected.version}/restore`,
+        { expectedCurrentVersion: p.current_version }
+      );
+      // 恢复成功：重新拉取剧本（正文/版本号/提示均已变），切回版本回溯并选中新版本
+      await openScript(state.script.id);
+      switchTab('versions');
+      await loadVersionsTab();
+      await selectVersion(r.version);
+      if (r.stats.pending > 0) {
+        toast(
+          `已恢复为第 ${r.version} 版：${r.stats.bound} 条自动绑定，${r.stats.pending} 条待确认`,
+          true
+        );
+      } else {
+        toast(`已恢复为第 ${r.version} 版，${r.stats.bound} 条提示全部重新定位成功`);
+      }
+    } catch (err) {
+      vs.busy = false;
+      if (err.status === 409) {
+        // 另一窗口已改版：同步服务端当前状态，旧预览作废，必须重新预览后才能再次确认
+        toast(`冲突：${err.message}`, true);
+        state.script = await api('GET', `/api/scripts/${state.script.id}`);
+        await loadVersionsTab();
+      } else {
+        toast(err.message, true);
+        renderRestorePanel();
+      }
+    }
+  }
 });
 
 /* =============================== 编辑剧本 =============================== */
