@@ -1,0 +1,1195 @@
+'use strict';
+
+const path = require('path');
+const express = require('express');
+const db = require('./db');
+const { relocalize, buildAnchor } = require('./reanchor');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.json({ limit: '5mb' }));
+app.use(express.static(path.join(__dirname, '..', 'public')));
+
+/* ----------------------------- 工具函数 ----------------------------- */
+
+function validateType(type) {
+  if (!['light', 'sound'].includes(type)) {
+    const e = new Error('提示类型必须为 light（灯光）或 sound（音效）');
+    e.status = 400;
+    throw e;
+  }
+}
+
+function getScriptOr404(scriptId) {
+  const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(scriptId);
+  if (!script) {
+    const e = new Error('剧本不存在');
+    e.status = 404;
+    throw e;
+  }
+  return script;
+}
+
+/**
+ * 待确认提示的候选行存于 issue_detail（格式 __CANDIDATES__{json}），
+ * 解析出展示文案与候选行列表。
+ */
+function parseCue(c) {
+  let candidates = [];
+  let detail = c.issue_detail || '';
+  if (detail.startsWith('__CANDIDATES__')) {
+    try {
+      const parsed = JSON.parse(detail.replace('__CANDIDATES__', ''));
+      detail = parsed.detail;
+      candidates = parsed.candidates;
+    } catch {
+      detail = '';
+    }
+  }
+  return {
+    ...c,
+    context_before: c.context_before ? JSON.parse(c.context_before) : [],
+    context_after: c.context_after ? JSON.parse(c.context_after) : [],
+    issue:
+      c.anchor_status === 'pending'
+        ? { type: c.issue_type, detail, candidates }
+        : null,
+  };
+}
+
+function listCues(scriptId) {
+  return db
+    .prepare('SELECT * FROM cues WHERE script_id = ? ORDER BY id')
+    .all(scriptId)
+    .map(parseCue);
+}
+
+/* ----------------------------- 剧本接口 ----------------------------- */
+
+// 剧本列表（不含正文）
+app.get('/api/scripts', (req, res) => {
+  const scripts = db
+    .prepare(
+      `SELECT s.id, s.title, s.current_version, s.created_at, s.updated_at,
+              COUNT(c.id) AS cue_count,
+              SUM(CASE WHEN c.anchor_status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+       FROM scripts s
+       LEFT JOIN cues c ON c.script_id = s.id
+       GROUP BY s.id
+       ORDER BY s.updated_at DESC`
+    )
+    .all();
+  res.json(scripts);
+});
+
+// 剧本详情（含全部提示）
+app.get('/api/scripts/:id', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  res.json({ ...script, cues: listCues(script.id) });
+});
+
+// 新建剧本
+app.post('/api/scripts', (req, res) => {
+  const title = (req.body.title || '').trim();
+  const content = typeof req.body.content === 'string' ? req.body.content : '';
+  if (!title) return res.status(400).json({ error: '剧本标题不能为空' });
+
+  const result = db.transaction(() => {
+    const info = db
+      .prepare('INSERT INTO scripts (title, content) VALUES (?, ?)')
+      .run(title, content);
+    db.prepare(
+      'INSERT INTO script_versions (script_id, version, title, content) VALUES (?, 1, ?, ?)'
+    ).run(info.lastInsertRowid, title, content);
+    return info.lastInsertRowid;
+  })();
+
+  res.status(201).json({ id: result });
+});
+
+// 修改标题
+app.patch('/api/scripts/:id', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const title = (req.body.title || '').trim();
+  if (!title) return res.status(400).json({ error: '剧本标题不能为空' });
+  db.prepare("UPDATE scripts SET title = ?, updated_at = datetime('now') WHERE id = ?").run(
+    title,
+    script.id
+  );
+  res.json({ ok: true });
+});
+
+// 保存新版正文 -> 全部提示重新定位
+app.put('/api/scripts/:id/content', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const content = typeof req.body.content === 'string' ? req.body.content : null;
+  if (content === null) return res.status(400).json({ error: '缺少 content 字段' });
+
+  const outcome = db.transaction(() => {
+    const newVersion = script.current_version + 1;
+    db.prepare(
+      `UPDATE scripts SET content = ?, current_version = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(content, newVersion, script.id);
+    db.prepare(
+      'INSERT INTO script_versions (script_id, version, title, content) VALUES (?, ?, ?, ?)'
+    ).run(script.id, newVersion, script.title, content);
+
+    const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(script.id);
+    const { results, stats } = relocalize(cues, content);
+
+    const boundStmt = db.prepare(
+      `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_status = 'bound',
+                       issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
+       WHERE id = ?`
+    );
+    const pendingStmt = db.prepare(
+      `UPDATE cues SET version = ?, line_no = NULL, line_text = NULL, anchor_status = 'pending',
+                       issue_type = ?, issue_detail = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    );
+
+    for (const r of results) {
+      if (r.status === 'bound') {
+        boundStmt.run(newVersion, r.lineNo, r.lineText, r.cueId);
+      } else {
+        const payload = '__CANDIDATES__' + JSON.stringify({
+          detail: r.issueDetail,
+          candidates: r.candidates || [],
+        });
+        pendingStmt.run(newVersion, r.issueType, payload, r.cueId);
+      }
+    }
+    return { version: newVersion, stats };
+  })();
+
+  res.json({ ok: true, ...outcome });
+});
+
+// 删除剧本
+app.delete('/api/scripts/:id', (req, res) => {
+  getScriptOr404(req.params.id);
+  db.prepare('DELETE FROM scripts WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+/* ----------------------------- 提示接口 ----------------------------- */
+
+// 在某行旁添加提示（同时生成锚点与上下文快照）
+app.post('/api/scripts/:id/cues', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const { type, label, note, lineNo } = req.body;
+  validateType(type);
+  if (!label || !String(label).trim()) {
+    return res.status(400).json({ error: '提示内容不能为空' });
+  }
+  const lineIndex = Number(lineNo) - 1;
+  if (!Number.isInteger(lineIndex)) {
+    return res.status(400).json({ error: '请选择提示所附着的台词行' });
+  }
+
+  const anchor = buildAnchor(script.content, lineIndex);
+  const info = db
+    .prepare(
+      `INSERT INTO cues (script_id, type, label, note, version, line_no, line_text,
+                         anchor_index, anchor_text, context_before, context_after, anchor_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'bound')`
+    )
+    .run(
+      script.id,
+      type,
+      String(label).trim(),
+      (note || '').trim(),
+      script.current_version,
+      lineIndex + 1,
+      anchor.anchorText,
+      lineIndex,
+      anchor.anchorText,
+      JSON.stringify(anchor.contextBefore),
+      JSON.stringify(anchor.contextAfter)
+    );
+  res.status(201).json({ id: info.lastInsertRowid });
+});
+
+// 编辑提示文案（不改动锚点）
+app.patch('/api/cues/:cueId', (req, res) => {
+  const cue = db.prepare('SELECT * FROM cues WHERE id = ?').get(req.params.cueId);
+  if (!cue) return res.status(404).json({ error: '提示不存在' });
+
+  const type = req.body.type !== undefined ? req.body.type : cue.type;
+  validateType(type);
+  const label = req.body.label !== undefined ? String(req.body.label).trim() : cue.label;
+  if (!label) return res.status(400).json({ error: '提示内容不能为空' });
+  const note = req.body.note !== undefined ? String(req.body.note).trim() : cue.note;
+
+  db.prepare(
+    `UPDATE cues SET type = ?, label = ?, note = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(type, label, note, cue.id);
+  res.json({ ok: true });
+});
+
+// 人工重新绑定：把提示挂到当前版本指定行，并重做锚点快照
+app.post('/api/cues/:cueId/rebind', (req, res) => {
+  const cue = db.prepare('SELECT * FROM cues WHERE id = ?').get(req.params.cueId);
+  if (!cue) return res.status(404).json({ error: '提示不存在' });
+  const script = getScriptOr404(cue.script_id);
+
+  const lineIndex = Number(req.body.lineNo) - 1;
+  if (!Number.isInteger(lineIndex)) {
+    return res.status(400).json({ error: '请选择要绑定的台词行' });
+  }
+  const anchor = buildAnchor(script.content, lineIndex);
+
+  db.prepare(
+    `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_index = ?, anchor_text = ?,
+                     context_before = ?, context_after = ?, anchor_status = 'bound',
+                     issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(
+    script.current_version,
+    lineIndex + 1,
+    anchor.anchorText,
+    lineIndex,
+    anchor.anchorText,
+    JSON.stringify(anchor.contextBefore),
+    JSON.stringify(anchor.contextAfter),
+    cue.id
+  );
+  res.json({ ok: true });
+});
+
+// 删除提示
+app.delete('/api/cues/:cueId', (req, res) => {
+  const cue = db.prepare('SELECT * FROM cues WHERE id = ?').get(req.params.cueId);
+  if (!cue) return res.status(404).json({ error: '提示不存在' });
+  db.prepare('DELETE FROM cues WHERE id = ?').run(cue.id);
+  res.json({ ok: true });
+});
+
+/* ----------------------------- 排练场次接口 ----------------------------- */
+
+/** 服务端当前时间（UTC epoch 秒，整数）：计时一律以服务端时间为准，跨刷新/跨浏览器一致 */
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * 某场次「当前有效排练秒数」（须在事务/读取后即时调用）：
+ * idle（从未开始）为 null（页面显示「未计时」）；paused 取已落账秒数；
+ * running 取已落账秒数 + 当前计时段经过的整数秒。
+ */
+function rehearsalSecondsAt(session, now) {
+  if (session.timer_state === 'idle') return null;
+  if (session.timer_state === 'paused') return session.timer_elapsed;
+  return session.timer_elapsed + Math.max(0, now - (session.timer_started_at || now));
+}
+
+/** 409：请求基于过期的场次进度（重复提交/越序处理/撤回错对象） */
+function conflict(message) {
+  const e = new Error(message);
+  e.status = 409;
+  return e;
+}
+
+function getSessionOr404(sessionId) {
+  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId);
+  if (!session) {
+    const e = new Error('场次不存在');
+    e.status = 404;
+    throw e;
+  }
+  return session;
+}
+
+/** 取当前版本已绑定、可执行的提示，按行号、提示 ID 排序 */
+function executableCues(scriptId) {
+  return db
+    .prepare(
+      `SELECT * FROM cues
+       WHERE script_id = ? AND anchor_status = 'bound' AND line_no IS NOT NULL
+       ORDER BY line_no ASC, id ASC`
+    )
+    .all(scriptId);
+}
+
+function countPendingCues(scriptId) {
+  return db
+    .prepare("SELECT COUNT(*) AS n FROM cues WHERE script_id = ? AND anchor_status = 'pending'")
+    .get(scriptId).n;
+}
+
+/** 组装场次完整状态（含冻结条目快照、进度、处理记录与修订建议） */
+function serializeSession(session) {
+  const now = nowSec();
+  const items = db
+    .prepare('SELECT * FROM session_items WHERE session_id = ? ORDER BY seq ASC')
+    .all(session.id);
+  const execs = db
+    .prepare(
+      `SELECT e.id, e.item_id, e.seq, e.kind, e.miss_reason, e.rehearsal_seconds, e.executed_at,
+              i.line_no, i.type, i.label, i.line_text
+       FROM session_executions e
+       JOIN session_items i ON i.id = e.item_id
+       WHERE e.session_id = ?
+       ORDER BY e.seq ASC`
+    )
+    .all(session.id);
+  const suggestions = db
+    .prepare(
+      `SELECT g.*, i.seq AS item_seq, i.line_no AS item_line_no,
+              i.label AS item_label, i.note AS item_note
+       FROM session_item_suggestions g
+       JOIN session_items i ON i.id = g.item_id
+       WHERE g.session_id = ?
+       ORDER BY g.id ASC`
+    )
+    .all(session.id);
+  // 补排场：逐条冻结的来源信息（来源场次、原条目、漏执行原因）
+  const makeupRows =
+    session.kind === 'makeup'
+      ? db
+          .prepare('SELECT * FROM session_makeup_sources WHERE session_id = ?')
+          .all(session.id)
+      : [];
+  const makeupByItem = new Map(makeupRows.map((m) => [m.item_id, m]));
+  const execByItem = new Map(execs.map((x) => [x.item_id, x]));
+  const sugByItem = new Map();
+  for (const g of suggestions) {
+    if (!sugByItem.has(g.item_id)) sugByItem.set(g.item_id, []);
+    sugByItem.get(g.item_id).push(g);
+  }
+  const doneCount = execs.filter((x) => x.kind === 'done').length;
+
+  // 补排场的来源场次（仅用于展示来源名称；来源场次删除后返回 null，冻结数据不受影响）
+  let sourceSession = null;
+  if (session.kind === 'makeup' && session.source_session_id != null) {
+    sourceSession = db
+      .prepare('SELECT id, name, script_version, created_at FROM sessions WHERE id = ?')
+      .get(session.source_session_id) || null;
+  }
+
+  return {
+    ...session,
+    progress: execs.length, // 已处理条数 = 已执行 + 漏执行（共用同一进度）
+    done_count: doneCount,
+    missed_count: execs.length - doneCount,
+    is_complete: execs.length >= session.total,
+    // 有效排练计时：timer_state/elapsed/started_at/version 为持久化状态；
+    // rehearsal_seconds 为服务端按当前时间算出的有效秒数（null=从未计时，显示「未计时」），
+    // server_now 供跨浏览器的页面本地跳动对表（与 timer_started_at 同属服务端时钟）
+    rehearsal_seconds: rehearsalSecondsAt(session, now),
+    server_now: now,
+    source_session: sourceSession,
+    items: items.map((it) => {
+      const rec = execByItem.get(it.id);
+      const m = makeupByItem.get(it.id);
+      return {
+        ...it,
+        status: rec ? rec.kind : 'pending', // 'done' | 'missed' | 'pending'
+        miss_reason: rec ? rec.miss_reason : null,
+        processed_at: rec ? rec.executed_at : null,
+        rehearsal_seconds: rec ? rec.rehearsal_seconds : null,
+        suggestions: sugByItem.get(it.id) || [],
+        // 补排条目带来源追溯：原条目、原处理顺序、原漏执行原因（创建时冻结，不随后续撤回变化）
+        makeup_source: m
+          ? {
+              source_session_id: m.source_session_id,
+              source_item_id: m.source_item_id,
+              source_execution_id: m.source_execution_id,
+              source_seq: m.source_seq,
+              miss_reason: m.miss_reason,
+            }
+          : null,
+      };
+    }),
+    executions: execs,
+    suggestions,
+    makeup_sources: makeupRows,
+  };
+}
+
+// 创建前预览：当前版本、可冻结提示数、被排除的待确认提示数
+app.get('/api/scripts/:id/sessions/preview', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const cues = executableCues(script.id);
+  res.json({
+    script_id: script.id,
+    title: script.title,
+    version: script.current_version,
+    total: cues.length,
+    excluded_pending: countPendingCues(script.id),
+    cues: cues.map((c) => ({
+      id: c.id,
+      line_no: c.line_no,
+      type: c.type,
+      label: c.label,
+      note: c.note,
+      line_text: c.line_text,
+    })),
+  });
+});
+
+// 从剧本当前版本创建场次（冻结行号/类型/内容/备注；无可执行提示不创建空场次）
+app.post('/api/scripts/:id/sessions', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const name =
+    req.body.name && String(req.body.name).trim()
+      ? String(req.body.name).trim()
+      : `${script.title} · 第${script.current_version}版排练`;
+
+  const sessionId = db.transaction(() => {
+    const cues = executableCues(script.id);
+    if (cues.length === 0) {
+      // 空场次没有任何意义：待确认提示无法执行，直接拒绝
+      throw conflict('当前版本没有可执行的已绑定提示，无法创建场次');
+    }
+    const pending = countPendingCues(script.id);
+
+    const info = db
+      .prepare(
+        `INSERT INTO sessions (script_id, name, script_version, total, excluded_pending)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(script.id, name, script.current_version, cues.length, pending);
+    const sid = info.lastInsertRowid;
+
+    const itemStmt = db.prepare(
+      `INSERT INTO session_items (session_id, seq, cue_id, line_no, type, label, note, line_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    cues.forEach((c, i) => {
+      itemStmt.run(sid, i + 1, c.id, c.line_no, c.type, c.label, c.note, c.line_text || '');
+    });
+    return sid;
+  })();
+
+  res.status(201).json({ id: sessionId });
+});
+
+// 场次列表（进度摘要：已执行/漏执行分开计数 + 修订建议状态计数）
+app.get('/api/scripts/:id/sessions', (req, res) => {
+  getScriptOr404(req.params.id);
+  const now = nowSec();
+  const sessions = db
+    .prepare(
+      `SELECT s.*,
+              (SELECT COUNT(*) FROM session_executions e WHERE e.session_id = s.id) AS progress,
+              (SELECT COUNT(*) FROM session_executions e
+                WHERE e.session_id = s.id AND e.kind = 'done') AS done_count,
+              (SELECT COUNT(*) FROM session_executions e
+                WHERE e.session_id = s.id AND e.kind = 'missed') AS missed_count,
+              (SELECT COUNT(*) FROM session_item_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'pending') AS pending_suggestions,
+              (SELECT COUNT(*) FROM session_item_suggestions g
+                WHERE g.session_id = s.id AND g.status = 'conflict') AS conflict_suggestions
+       FROM sessions s
+       WHERE s.script_id = ?
+       ORDER BY s.created_at DESC, s.id DESC`
+    )
+    .all(req.params.id)
+    .map((s) => ({
+      ...s,
+      is_complete: s.progress >= s.total,
+      rehearsal_seconds: rehearsalSecondsAt(s, now),
+    }));
+  res.json(sessions);
+});
+
+// 场次详情（快照与执行记录）
+app.get('/api/sessions/:sessionId', (req, res) => {
+  res.json(serializeSession(getSessionOr404(req.params.sessionId)));
+});
+
+/* ----------------------------- 有效排练计时 ----------------------------- */
+
+/**
+ * 开始 / 暂停 / 继续有效排练计时（单一接口按 action 切换）：
+ *   - 全部状态在服务端持久化：timer_state（idle/running/paused）、timer_elapsed（已落账秒数）、
+ *     timer_started_at（当前计时段开始的服务端 epoch 秒）、timer_version（状态版本）；
+ *   - 有效时长一律按服务端时钟结算，跨刷新、跨浏览器、服务重启后都一致；
+ *   - 请求必须带 expectedVersion：重复提交、基于旧版本（另一浏览器已切换）一律 409，
+ *     每段经过时间只在 running→paused（或完成自动停表）时结算一次，不能重复累计；
+ *   - 已完成的场次不能再切换计时。
+ */
+app.post('/api/sessions/:sessionId/timer', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const action = String(req.body.action || '');
+  const expectedVersion = Number(req.body.expectedVersion);
+  if (!['start', 'pause', 'resume'].includes(action)) {
+    return res.status(400).json({ error: "action 必须为 start / pause / resume 之一" });
+  }
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+    return res.status(400).json({ error: '缺少预期计时状态版本 expectedVersion' });
+  }
+
+  const timer = db.transaction(() => {
+    // 事务内重新读取，避免并发下基于过期状态切换
+    const cur = db.prepare('SELECT * FROM sessions WHERE id = ?').get(session.id);
+    if (cur.timer_version !== expectedVersion) {
+      throw conflict('计时状态已变化（可能在其他页面切换过），请刷新后重试');
+    }
+    const done = db
+      .prepare('SELECT COUNT(*) AS n FROM session_executions WHERE session_id = ?')
+      .get(cur.id).n;
+    if (done >= cur.total) {
+      throw conflict('本场次已全部处理完毕，不能再切换计时');
+    }
+
+    const now = nowSec();
+    let state = cur.timer_state;
+    let elapsed = cur.timer_elapsed;
+    let startedAt = cur.timer_started_at;
+
+    if (action === 'start') {
+      if (state !== 'idle') throw conflict('计时已经开始，请勿重复开始');
+      state = 'running';
+      startedAt = now;
+    } else if (action === 'pause') {
+      if (state !== 'running') throw conflict('计时当前不在进行中，不能暂停');
+      // 本段有效秒数在此唯一结算点落账：重复/过期请求已被版本校验挡住，不会重复累计
+      elapsed += Math.max(0, now - (startedAt || now));
+      state = 'paused';
+      startedAt = null;
+    } else {
+      if (state !== 'paused') throw conflict('计时当前未暂停，不能继续');
+      state = 'running';
+      startedAt = now;
+    }
+
+    db.prepare(
+      `UPDATE sessions
+       SET timer_state = ?, timer_elapsed = ?, timer_started_at = ?, timer_version = timer_version + 1
+       WHERE id = ?`
+    ).run(state, elapsed, startedAt, cur.id);
+
+    return {
+      timer_state: state,
+      timer_elapsed: elapsed,
+      timer_started_at: startedAt,
+      timer_version: cur.timer_version + 1,
+      rehearsal_seconds:
+        state === 'running' ? elapsed + Math.max(0, now - startedAt) : elapsed,
+      server_now: now,
+    };
+  })();
+
+  res.json({ ok: true, ...timer });
+});
+
+/* ----------------------------- 漏项补排 ----------------------------- */
+
+/**
+ * 取某场次「当前尚未补排」的漏执行记录（须在事务内复核状态时与创建接口共用同一查询）。
+ * 条件：① 处理记录为漏执行（kind='missed'）；② 未被任何补排场引用
+ * （session_makeup_sources UNIQUE(source_execution_id) 同时兜底）。
+ * 按来源队列顺序（原处理 seq 升序）返回，行号/类型/文案/备注均取自来源冻结条目。
+ */
+function makeupCandidates(sessionId) {
+  return db
+    .prepare(
+      `SELECT e.id AS execution_id, e.seq AS execution_seq, e.miss_reason,
+              i.id AS item_id, i.seq AS item_seq, i.cue_id,
+              i.line_no, i.type, i.label, i.note, i.line_text
+       FROM session_executions e
+       JOIN session_items i ON i.id = e.item_id
+       WHERE e.session_id = ? AND e.kind = 'missed'
+         AND NOT EXISTS (
+           SELECT 1 FROM session_makeup_sources m WHERE m.source_execution_id = e.id
+         )
+       ORDER BY e.seq ASC`
+    )
+    .all(sessionId);
+}
+
+function countMissed(sessionId) {
+  return db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM session_executions WHERE session_id = ? AND kind = 'missed'"
+    )
+    .get(sessionId).n;
+}
+
+// 补排前预览：来源场次的漏执行总数、已补排数、当前可补排条目（冻结字段 + 原漏执行原因）
+app.get('/api/sessions/:sessionId/makeup-preview', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const candidates = makeupCandidates(session.id);
+  res.json({
+    session_id: session.id,
+    name: session.name,
+    script_id: session.script_id,
+    script_version: session.script_version,
+    kind: session.kind,
+    missed_total: countMissed(session.id),
+    made_up: countMissed(session.id) - candidates.length,
+    available: candidates.length,
+    items: candidates,
+  });
+});
+
+/**
+ * 一键生成漏项补排场：
+ *   - 按原队列顺序冻结每条漏执行条目的行号、类型、文案、备注及漏执行原因，
+ *     并通过 session_makeup_sources 记下来源场次 / 原条目 / 原处理记录；
+ *   - 创建时在同一事务内重新查询来源记录仍为漏执行、且尚未进入任何补排场；
+ *   - 请求可带 sourceExecutionIds 指定子集；提交的记录若已被撤回 / 已补排 / 不属于该场，
+ *     一律 409（不静默忽略，避免基于过期页面生成错误的场次）；
+ *   - UNIQUE(source_execution_id) 保证同一条漏执行记录只能进入一个补排场；
+ *   - 没有可冻结条目时 409，绝不生成空场次。
+ * 原场次与其提示、冻结条目、执行记录均不改动。
+ */
+app.post('/api/sessions/:sessionId/makeup', (req, res) => {
+  const source = getSessionOr404(req.params.sessionId);
+  let requested = null;
+  if (req.body.sourceExecutionIds !== undefined) {
+    if (!Array.isArray(req.body.sourceExecutionIds)) {
+      return res.status(400).json({ error: 'sourceExecutionIds 必须为数组' });
+    }
+    requested = [];
+    for (const x of req.body.sourceExecutionIds) {
+      const n = Number(x);
+      if (!Number.isInteger(n) || n <= 0) {
+        return res.status(400).json({ error: 'sourceExecutionIds 中的记录 ID 非法' });
+      }
+      if (!requested.includes(n)) requested.push(n);
+    }
+  }
+  const defaultName =
+    source.kind === 'makeup' ? `${source.name} · 再次补排` : `${source.name} · 漏项补排`;
+  const name =
+    req.body.name && String(req.body.name).trim() ? String(req.body.name).trim() : defaultName;
+
+  const outcome = db.transaction(() => {
+    // 事务内复核：重新读取来源场次当前全部「仍漏执行且未补排」记录
+    const candidates = makeupCandidates(source.id);
+    if (candidates.length === 0) {
+      throw conflict('来源场次当前没有尚未补排的漏执行记录，无法生成补排场次');
+    }
+    let chosen = candidates;
+    if (requested) {
+      if (requested.length === 0) {
+        throw conflict('未选择任何漏执行记录，不能生成空补排场次');
+      }
+      const byId = new Map(candidates.map((c) => [c.execution_id, c]));
+      chosen = [];
+      for (const id of requested) {
+        const c = byId.get(id);
+        if (!c) {
+          // 记录不属于此场、已不是漏执行（被撤回后整行删除）、或已进入其他补排场。
+          // 撤回的语义无法从已删除的行区分「从未存在」，统一以过期/无效请求 409 告知并要求刷新。
+          throw conflict('存在已被撤回、已补排或不属于该场次的来源记录，该补排请求已过期（冲突），请刷新后重试');
+        }
+        chosen.push(c);
+      }
+      // makeupCandidates 已按原 seq 升序，chosen 保持请求顺序可能乱序，这里恢复原队列顺序
+      chosen.sort((a, b) => a.execution_seq - b.execution_seq);
+    }
+
+    const info = db
+      .prepare(
+        `INSERT INTO sessions (script_id, name, script_version, total, excluded_pending,
+                               kind, source_session_id)
+         VALUES (?, ?, ?, ?, 0, 'makeup', ?)`
+      )
+      .run(source.script_id, name, source.script_version, chosen.length, source.id);
+    const sid = info.lastInsertRowid;
+
+    const itemStmt = db.prepare(
+      `INSERT INTO session_items (session_id, seq, cue_id, line_no, type, label, note, line_text)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const srcStmt = db.prepare(
+      `INSERT INTO session_makeup_sources
+         (session_id, item_id, source_session_id, source_item_id, source_execution_id,
+          source_seq, original_line_no, original_type, original_label, original_note,
+          original_line_text, miss_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    chosen.forEach((c, i) => {
+      // 按原队列顺序重新编号 seq；冻结字段全部取自来源条目快照与漏执行处理记录
+      const r = itemStmt.run(
+        sid,
+        i + 1,
+        c.cue_id,
+        c.line_no,
+        c.type,
+        c.label,
+        c.note,
+        c.line_text || ''
+      );
+      try {
+        srcStmt.run(
+          sid,
+          r.lastInsertRowid,
+          source.id,
+          c.item_id,
+          c.execution_id,
+          c.execution_seq,
+          c.line_no,
+          c.type,
+          c.label,
+          c.note,
+          c.line_text || '',
+          c.miss_reason
+        );
+      } catch (err) {
+        if (String(err.message).includes('UNIQUE')) {
+          // 并发下另一个请求已把同一漏执行记录补排：整笔事务回滚，冲突告知
+          throw conflict('部分漏执行记录已进入其他补排场次，请刷新后重试');
+        }
+        throw err;
+      }
+    });
+
+    return { id: sid, count: chosen.length };
+  })();
+
+  res.status(201).json({ id: outcome.id, total: outcome.count });
+});
+
+/* ----------------------------- 场次对照 ----------------------------- */
+
+/** 取场次冻结条目并合并执行状态（done / missed / pending），按队列序号排序 */
+function sessionItemsWithStatus(sessionId) {
+  const items = db
+    .prepare('SELECT * FROM session_items WHERE session_id = ? ORDER BY seq ASC')
+    .all(sessionId);
+  const execs = db
+    .prepare('SELECT item_id, kind, miss_reason, executed_at FROM session_executions WHERE session_id = ?')
+    .all(sessionId);
+  const byItem = new Map(execs.map((e) => [e.item_id, e]));
+  return items.map((it) => {
+    const rec = byItem.get(it.id);
+    return {
+      cue_id: it.cue_id,
+      seq: it.seq,
+      line_no: it.line_no,
+      type: it.type,
+      label: it.label,
+      note: it.note,
+      line_text: it.line_text,
+      status: rec ? rec.kind : 'pending',
+      miss_reason: rec ? rec.miss_reason : null,
+      processed_at: rec ? rec.executed_at : null,
+    };
+  });
+}
+
+function compareSessionSummary(s) {
+  return {
+    id: s.id,
+    name: s.name,
+    script_version: s.script_version,
+    total: s.total,
+    done_count: s.done_count,
+    missed_count: s.missed_count,
+    created_at: s.created_at,
+  };
+}
+
+/**
+ * 同一剧本两场场次的对照（只读，不改写任何场次或提示数据）。
+ * 配对规则：以冻结条目记录的来源提示 ID（session_items.cue_id）对齐——
+ * 同一场次内 cue_id 唯一，因此基准场与对照场中 cue_id 相同的条目互为同一条提示；
+ * 绝不按队列序号或台词文本配对。cue_id 为空（历史数据）的条目无法配对，按各自场次独有处理。
+ * 展示顺序：共同提示与基准场独有提示按基准场队列顺序排列；对照场独有（新增）提示
+ * 接在末尾，并保持其在对照场中的队列顺序。
+ */
+app.get('/api/scripts/:id/sessions/compare', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const baseId = Number(req.query.base);
+  const compareId = Number(req.query.compare);
+  if (!Number.isInteger(baseId) || !Number.isInteger(compareId)) {
+    return res.status(400).json({ error: '请通过 base 与 compare 参数指定要对照的两个场次' });
+  }
+  if (baseId === compareId) {
+    return res.status(400).json({ error: '基准场与对照场不能是同一场次' });
+  }
+  const base = db
+    .prepare('SELECT * FROM sessions WHERE id = ? AND script_id = ?')
+    .get(baseId, script.id);
+  if (!base) return res.status(404).json({ error: '基准场次不存在或不属于该剧本' });
+  const compare = db
+    .prepare('SELECT * FROM sessions WHERE id = ? AND script_id = ?')
+    .get(compareId, script.id);
+  if (!compare) return res.status(404).json({ error: '对照场次不存在或不属于该剧本' });
+
+  const baseItems = sessionItemsWithStatus(base.id);
+  const compareItems = sessionItemsWithStatus(compare.id);
+  const compareByCue = new Map();
+  for (const it of compareItems) {
+    if (it.cue_id != null) compareByCue.set(it.cue_id, it);
+  }
+
+  const rows = [];
+  const matchedCompareCueIds = new Set();
+  let commonCount = 0;
+  let changedCount = 0;
+  let unchangedCount = 0;
+
+  // 按基准场顺序：共同提示（含变化检测）与基准场独有提示
+  for (const b of baseItems) {
+    const c = b.cue_id != null ? compareByCue.get(b.cue_id) : undefined;
+    if (!c) {
+      rows.push({ kind: 'only-base', cue_id: b.cue_id, base: b });
+      continue;
+    }
+    matchedCompareCueIds.add(c.cue_id);
+    const changes = {
+      line_no: b.line_no !== c.line_no,
+      type: b.type !== c.type,
+      label: b.label !== c.label,
+      note: b.note !== c.note,
+      status: b.status !== c.status,
+    };
+    const changed = Object.values(changes).some(Boolean);
+    commonCount += 1;
+    if (changed) changedCount += 1;
+    else unchangedCount += 1;
+    rows.push({ kind: 'common', cue_id: b.cue_id, base: b, compare: c, changes, changed });
+  }
+
+  // 对照场独有（新增）提示：接在末尾，保持对照场顺序
+  let onlyCompareCount = 0;
+  for (const c of compareItems) {
+    if (c.cue_id != null && matchedCompareCueIds.has(c.cue_id)) continue;
+    onlyCompareCount += 1;
+    rows.push({ kind: 'only-compare', cue_id: c.cue_id, compare: c });
+  }
+
+  res.json({
+    script_id: script.id,
+    base: compareSessionSummary(base),
+    compare: compareSessionSummary(compare),
+    stats: {
+      common: commonCount,
+      changed: changedCount,
+      unchanged: unchangedCount,
+      only_base: baseItems.length - commonCount,
+      only_compare: onlyCompareCount,
+    },
+    rows,
+  });
+});
+
+/**
+ * 正常执行与漏执行共用的队首推进校验（须在事务内调用）：
+ * 预期进度必须等于服务端当前已处理条数，且目标条目必须是队首；
+ * 过期/重复/越序一律 409。返回队首条目与当前已处理数。
+ */
+function checkHeadAdvance(session, itemId, expectedProgress) {
+  const done = db
+    .prepare('SELECT COUNT(*) AS n FROM session_executions WHERE session_id = ?')
+    .get(session.id).n;
+
+  // 过期请求：客户端看到的进度已经不是服务端当前进度
+  if (done !== expectedProgress) {
+    throw conflict('场次进度已变化，请刷新后重试（你的请求已过期）');
+  }
+  if (done >= session.total) {
+    throw conflict('本场次已全部处理完毕，不能推进下一条');
+  }
+
+  // 一次只能处理队首
+  const head = db
+    .prepare('SELECT * FROM session_items WHERE session_id = ? ORDER BY seq ASC LIMIT 1 OFFSET ?')
+    .get(session.id, done);
+  if (!head) throw conflict('找不到下一条可处理条目');
+  if (head.id !== itemId) {
+    throw conflict('只能处理队首条目，不能跳过或乱序');
+  }
+  return { head, done };
+}
+
+/**
+ * 追加一条处理记录；UNIQUE 冲突 = 该条目已处理（重复请求）。
+ * rehearsalSeconds 为该处理时刻的有效排练秒数（同一事务内快照，null=从未计时）。
+ */
+function insertExecution(sessionId, itemId, seq, kind, missReason, rehearsalSeconds) {
+  try {
+    db.prepare(
+      `INSERT INTO session_executions
+         (session_id, item_id, seq, kind, miss_reason, rehearsal_seconds)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(sessionId, itemId, seq, kind, missReason, rehearsalSeconds);
+  } catch (err) {
+    if (String(err.message).includes('UNIQUE')) {
+      throw conflict('该条目已处理，请勿重复提交');
+    }
+    throw err;
+  }
+}
+
+/**
+ * 处理后场次即全部完成时，同一事务内自动停表：running 才结算最后一段，
+ * paused/idle 不动累计值；timer_version +1（结束态，之后不允许再切换）。
+ * 返回完成后场次的有效排练秒数（idle 仍为 null）。
+ */
+function settleTimerOnComplete(session, newDone, now) {
+  if (newDone < session.total) return;
+  const cur = db
+    .prepare('SELECT timer_state, timer_elapsed, timer_started_at, timer_version FROM sessions WHERE id = ?')
+    .get(session.id);
+  if (cur.timer_state === 'running') {
+    const elapsed = cur.timer_elapsed + Math.max(0, now - (cur.timer_started_at || now));
+    db.prepare(
+      `UPDATE sessions
+       SET timer_state = 'paused', timer_elapsed = ?, timer_started_at = NULL,
+           timer_version = timer_version + 1
+       WHERE id = ?`
+    ).run(elapsed, session.id);
+  } else if (cur.timer_state === 'paused') {
+    // 已暂停即为最终值，仅推进版本号以标记停表时刻（不重复加时间）
+    db.prepare('UPDATE sessions SET timer_version = timer_version + 1 WHERE id = ?').run(session.id);
+  }
+}
+
+/** 事务内：取队首推进 + 当前有效排练秒数快照（用于写入该条处理的时间点） */
+function currentRehearsalSeconds(sessionId, now) {
+  const t = db
+    .prepare('SELECT timer_state, timer_elapsed, timer_started_at FROM sessions WHERE id = ?')
+    .get(sessionId);
+  return rehearsalSecondsAt(t, now);
+}
+
+// 执行队首条目：提交目标条目与预期进度做乐观锁校验
+app.post('/api/sessions/:sessionId/execute', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const itemId = Number(req.body.itemId);
+  const expectedProgress = Number(req.body.expectedProgress);
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return res.status(400).json({ error: '缺少要执行的目标条目' });
+  }
+  if (!Number.isInteger(expectedProgress) || expectedProgress < 0) {
+    return res.status(400).json({ error: '缺少预期进度 expectedProgress' });
+  }
+
+  const result = db.transaction(() => {
+    const { head, done } = checkHeadAdvance(session, itemId, expectedProgress);
+    const now = nowSec();
+    // 同事务记录该处理时刻对应的有效排练秒数（从未计时则为 NULL → 显示「未计时」）
+    insertExecution(
+      session.id,
+      head.id,
+      done + 1,
+      'done',
+      null,
+      currentRehearsalSeconds(session.id, now)
+    );
+    // 全部处理完：同事务自动停表落账，最后一段也只结算一次
+    settleTimerOnComplete(session, done + 1, now);
+    return done + 1;
+  })();
+
+  res.json({ ok: true, progress: result });
+});
+
+// 漏执行登记：队首无法按计划执行时，填写原因并标记为漏执行，随后继续处理下一条。
+// 与正常执行共用场次进度与预期进度校验（重复提交/越序/过期同样返回 409）。
+app.post('/api/sessions/:sessionId/miss', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const itemId = Number(req.body.itemId);
+  const expectedProgress = Number(req.body.expectedProgress);
+  const reason = String(req.body.reason || '').trim();
+  if (!Number.isInteger(itemId) || itemId <= 0) {
+    return res.status(400).json({ error: '缺少要登记的目标条目' });
+  }
+  if (!Number.isInteger(expectedProgress) || expectedProgress < 0) {
+    return res.status(400).json({ error: '缺少预期进度 expectedProgress' });
+  }
+  if (!reason) {
+    return res.status(400).json({ error: '请填写漏执行原因' });
+  }
+
+  const result = db.transaction(() => {
+    const { head, done } = checkHeadAdvance(session, itemId, expectedProgress);
+    const now = nowSec();
+    insertExecution(
+      session.id,
+      head.id,
+      done + 1,
+      'missed',
+      reason,
+      currentRehearsalSeconds(session.id, now)
+    );
+    settleTimerOnComplete(session, done + 1, now);
+    return done + 1;
+  })();
+
+  res.json({ ok: true, progress: result });
+});
+
+// 撤回最后处理的一条（正常执行或漏执行），该条回到待处理（同样带乐观锁）
+app.post('/api/sessions/:sessionId/undo', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const expectedProgress = Number(req.body.expectedProgress);
+  if (!Number.isInteger(expectedProgress) || expectedProgress < 0) {
+    return res.status(400).json({ error: '缺少预期进度 expectedProgress' });
+  }
+
+  const result = db.transaction(() => {
+    const last = db
+      .prepare(
+        `SELECT * FROM session_executions WHERE session_id = ?
+         ORDER BY seq DESC LIMIT 1`
+      )
+      .get(session.id);
+    if (!last) throw conflict('没有可撤回的处理记录');
+
+    const done = db
+      .prepare('SELECT COUNT(*) AS n FROM session_executions WHERE session_id = ?')
+      .get(session.id).n;
+    if (done !== expectedProgress) {
+      throw conflict('场次进度已变化，请刷新后重试（你的撤回请求已过期）');
+    }
+
+    // 删除该条处理记录即同时移除其有效排练秒数时间点；冻结条目（队列顺序）保持不变。
+    // 计时状态不回滚：若撤回前已完成并自动停表，撤回后场次回到未完成、计时保持暂停，可再点「继续」。
+    db.prepare('DELETE FROM session_executions WHERE id = ?').run(last.id);
+    return done - 1;
+  })();
+
+  res.json({ ok: true, progress: result });
+});
+
+/* ----------------------------- 场次条目修订建议 ----------------------------- */
+
+function getSuggestionOr404(suggestionId) {
+  const sug = db
+    .prepare('SELECT * FROM session_item_suggestions WHERE id = ?')
+    .get(suggestionId);
+  if (!sug) {
+    const e = new Error('建议不存在');
+    e.status = 404;
+    throw e;
+  }
+  return sug;
+}
+
+// 为冻结条目提交修订建议（新的提示内容 + 备注），保存在场次下
+app.post('/api/sessions/:sessionId/items/:itemId/suggestions', (req, res) => {
+  const session = getSessionOr404(req.params.sessionId);
+  const item = db
+    .prepare('SELECT * FROM session_items WHERE id = ? AND session_id = ?')
+    .get(Number(req.params.itemId), session.id);
+  if (!item) return res.status(404).json({ error: '场次条目不存在' });
+
+  const label = String(req.body.label || '').trim();
+  const note = String(req.body.note || '').trim();
+  if (!label) return res.status(400).json({ error: '请填写建议的提示内容' });
+
+  const info = db
+    .prepare(
+      `INSERT INTO session_item_suggestions (session_id, item_id, label, note)
+       VALUES (?, ?, ?, ?)`
+    )
+    .run(session.id, item.id, label, note);
+  res.status(201).json({ id: info.lastInsertRowid });
+});
+
+// 修改建议：仅未采纳的建议可改；修改后回到待处理状态，可再次尝试采纳
+app.patch('/api/suggestions/:suggestionId', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+  if (sug.status === 'adopted') {
+    return res.status(409).json({ error: '该建议已被采纳，作为历史记录保留，不能再修改' });
+  }
+
+  const label = req.body.label !== undefined ? String(req.body.label).trim() : sug.label;
+  if (!label) return res.status(400).json({ error: '请填写建议的提示内容' });
+  const note = req.body.note !== undefined ? String(req.body.note).trim() : sug.note;
+
+  db.prepare(
+    `UPDATE session_item_suggestions
+     SET label = ?, note = ?, status = 'pending', conflict_reason = NULL,
+         updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(label, note, sug.id);
+  res.json({ ok: true });
+});
+
+// 删除（撤回）建议：已采纳的作为历史保留，不可删除
+app.delete('/api/suggestions/:suggestionId', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+  if (sug.status === 'adopted') {
+    return res.status(409).json({ error: '该建议已被采纳，作为历史记录保留，不能删除' });
+  }
+  db.prepare('DELETE FROM session_item_suggestions WHERE id = ?').run(sug.id);
+  res.json({ ok: true });
+});
+
+/**
+ * 采纳建议：同一事务内核对——
+ *   1. 来源提示仍存在；
+ *   2. 剧本当前版本与场次冻结版本一致，且提示仍绑定在快照行；
+ *   3. 提示的类型、内容、备注与条目快照一致（即排练后无人改过）。
+ * 任一不符：标记建议为冲突并保留（提交该标记），返回 409，绝不覆盖排练后的编辑；
+ * 全部通过：把建议的内容/备注写回当前提示，并标记建议已采纳。
+ * 场次冻结条目与执行记录始终不被改动。
+ */
+app.post('/api/suggestions/:suggestionId/adopt', (req, res) => {
+  const sug = getSuggestionOr404(req.params.suggestionId);
+
+  const outcome = db.transaction(() => {
+    if (sug.status === 'adopted') {
+      throw conflict('该建议已被采纳，不能重复采纳');
+    }
+    const item = db.prepare('SELECT * FROM session_items WHERE id = ?').get(sug.item_id);
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sug.session_id);
+    if (!item || !session) throw conflict('场次或条目已不存在');
+
+    let failReason = null;
+    const cue =
+      item.cue_id == null
+        ? null
+        : db.prepare('SELECT * FROM cues WHERE id = ?').get(item.cue_id);
+
+    if (!cue) {
+      failReason = '来源提示已被删除，无法回写';
+    } else {
+      const script = db.prepare('SELECT * FROM scripts WHERE id = ?').get(session.script_id);
+      if (!script || script.current_version !== session.script_version) {
+        failReason = `剧本已改版（当前第 ${script ? script.current_version : '?'} 版，场次冻结自第 ${session.script_version} 版）`;
+      } else if (cue.anchor_status !== 'bound' || cue.line_no !== item.line_no) {
+        failReason = '来源提示的绑定行已变化（可能被重新绑定或待确认）';
+      } else if (cue.type !== item.type || cue.label !== item.label || cue.note !== item.note) {
+        failReason = '来源提示的类型/内容/备注已与场次快照不一致（排练后被编辑过）';
+      }
+    }
+
+    if (failReason) {
+      // 保留建议，仅把冲突状态与原因落库，随后以 409 告知调用方
+      db.prepare(
+        `UPDATE session_item_suggestions
+         SET status = 'conflict', conflict_reason = ?, updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(failReason, sug.id);
+      return { ok: false, reason: failReason };
+    }
+
+    db.prepare(
+      `UPDATE cues SET label = ?, note = ?, updated_at = datetime('now') WHERE id = ?`
+    ).run(sug.label, sug.note, cue.id);
+    db.prepare(
+      `UPDATE session_item_suggestions
+       SET status = 'adopted', conflict_reason = NULL, updated_at = datetime('now')
+       WHERE id = ?`
+    ).run(sug.id);
+    return { ok: true };
+  })();
+
+  if (!outcome.ok) {
+    return res.status(409).json({ error: `采纳失败：${outcome.reason}`, conflict: true });
+  }
+  res.json({ ok: true });
+});
+
+/* ----------------------------- 错误处理 ----------------------------- */
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  res.status(err.status || 500).json({ error: err.message || '服务器内部错误' });
+});
+
+app.listen(PORT, () => {
+  console.log(`台词提示单已启动: http://localhost:${PORT}`);
+});
