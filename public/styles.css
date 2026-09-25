@@ -766,3 +766,67 @@ body {
   .cmp-summary { flex-direction: column; }
   .cmp-vs { transform: rotate(90deg); }
 }
+
+/* ---------------- 版本回溯 ---------------- */
+.ver-grid { align-items: start; }
+.ver-panel { margin-bottom: 0; }
+.version-list { display: flex; flex-direction: column; gap: 8px; }
+.version-item {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.version-item:hover { border-color: var(--primary); }
+.version-item.active { border-color: var(--primary); background: rgba(124, 108, 240, 0.08); }
+.version-item-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.version-item-name { font-weight: 600; }
+.version-item-title { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+.version-item-time { color: var(--text-dim); font-size: 12px; margin-top: 2px; }
+
+.ver-viewer { max-height: 56vh; }
+.ver-action-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 14px 2px;
+}
+
+.ver-preview-box {
+  background: var(--bg);
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.ver-preview-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.ver-preview-stats { font-size: 14px; margin-top: 8px; display: flex; gap: 14px; flex-wrap: wrap; }
+.ver-preview-ok { color: var(--ok); font-size: 13.5px; margin-top: 6px; }
+.ver-pending-list {
+  background: var(--danger-bg);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+}
+.ver-pending-head { color: var(--danger); font-size: 13.5px; font-weight: 600; }
+.ver-pending-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-top: 6px;
+  font-size: 13px;
+}
+.ver-pending-reason { color: var(--danger); font-size: 12.5px; }
+.ver-preview-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; }

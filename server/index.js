@@ -120,50 +120,181 @@ app.patch('/api/scripts/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * 保存新版正文并在同一事务内按现有重定位规则更新全部提示
+ * （「编辑保存新版」与「历史版本回溯恢复」共用）：
+ *   - 插入新的 script_versions 快照并推进 scripts.current_version；
+ *   - relocalize 逐提示重新定位：唯一命中才自动绑定；
+ *     重复台词无法唯一定位时保持待确认，并把候选行写入 issue_detail。
+ * 必须在 db.transaction 事务函数内调用。
+ * @returns {{version:number, stats:{total:number,bound:number,pending:number}}}
+ */
+function persistNewVersion(scriptId, title, content) {
+  const cur = db.prepare('SELECT current_version FROM scripts WHERE id = ?').get(scriptId);
+  const newVersion = cur.current_version + 1;
+  db.prepare(
+    `UPDATE scripts SET content = ?, current_version = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(content, newVersion, scriptId);
+  db.prepare(
+    'INSERT INTO script_versions (script_id, version, title, content) VALUES (?, ?, ?, ?)'
+  ).run(scriptId, newVersion, title, content);
+
+  const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(scriptId);
+  const { results, stats } = relocalize(cues, content);
+
+  const boundStmt = db.prepare(
+    `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_status = 'bound',
+                     issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
+     WHERE id = ?`
+  );
+  const pendingStmt = db.prepare(
+    `UPDATE cues SET version = ?, line_no = NULL, line_text = NULL, anchor_status = 'pending',
+                     issue_type = ?, issue_detail = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  );
+
+  for (const r of results) {
+    if (r.status === 'bound') {
+      boundStmt.run(newVersion, r.lineNo, r.lineText, r.cueId);
+    } else {
+      const payload = '__CANDIDATES__' + JSON.stringify({
+        detail: r.issueDetail,
+        candidates: r.candidates || [],
+      });
+      pendingStmt.run(newVersion, r.issueType, payload, r.cueId);
+    }
+  }
+  return { version: newVersion, stats };
+}
+
 // 保存新版正文 -> 全部提示重新定位
 app.put('/api/scripts/:id/content', (req, res) => {
   const script = getScriptOr404(req.params.id);
   const content = typeof req.body.content === 'string' ? req.body.content : null;
   if (content === null) return res.status(400).json({ error: '缺少 content 字段' });
 
-  const outcome = db.transaction(() => {
-    const newVersion = script.current_version + 1;
-    db.prepare(
-      `UPDATE scripts SET content = ?, current_version = ?, updated_at = datetime('now') WHERE id = ?`
-    ).run(content, newVersion, script.id);
-    db.prepare(
-      'INSERT INTO script_versions (script_id, version, title, content) VALUES (?, ?, ?, ?)'
-    ).run(script.id, newVersion, script.title, content);
-
-    const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(script.id);
-    const { results, stats } = relocalize(cues, content);
-
-    const boundStmt = db.prepare(
-      `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_status = 'bound',
-                       issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
-       WHERE id = ?`
-    );
-    const pendingStmt = db.prepare(
-      `UPDATE cues SET version = ?, line_no = NULL, line_text = NULL, anchor_status = 'pending',
-                       issue_type = ?, issue_detail = ?, updated_at = datetime('now')
-       WHERE id = ?`
-    );
-
-    for (const r of results) {
-      if (r.status === 'bound') {
-        boundStmt.run(newVersion, r.lineNo, r.lineText, r.cueId);
-      } else {
-        const payload = '__CANDIDATES__' + JSON.stringify({
-          detail: r.issueDetail,
-          candidates: r.candidates || [],
-        });
-        pendingStmt.run(newVersion, r.issueType, payload, r.cueId);
-      }
-    }
-    return { version: newVersion, stats };
-  })();
+  const outcome = db.transaction(() => persistNewVersion(script.id, script.title, content))();
 
   res.json({ ok: true, ...outcome });
+});
+
+/* ----------------------------- 剧本版本回溯 ----------------------------- */
+
+/** 取某剧本指定版本号的历史快照，不存在抛 404 */
+function getVersionOr404(scriptId, versionRaw) {
+  const version = Number(versionRaw);
+  if (!Number.isInteger(version) || version <= 0) {
+    const e = new Error('版本号必须为正整数');
+    e.status = 400;
+    throw e;
+  }
+  const row = db
+    .prepare('SELECT id, script_id, version, title, content, created_at FROM script_versions WHERE script_id = ? AND version = ?')
+    .get(scriptId, version);
+  if (!row) {
+    const e = new Error('该版本不存在（可能已被删除或尚未保存）');
+    e.status = 404;
+    throw e;
+  }
+  return row;
+}
+
+// 版本列表：版本号与保存时间（不含正文，正文点开单独获取）
+app.get('/api/scripts/:id/versions', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const versions = db
+    .prepare(
+      `SELECT id, version, title, created_at,
+              LENGTH(content) AS content_length,
+              (version = ?) AS is_current
+       FROM script_versions
+       WHERE script_id = ?
+       ORDER BY version DESC`
+    )
+    .all(script.current_version, script.id)
+    .map((v) => ({ ...v, is_current: !!v.is_current }));
+  res.json({
+    script_id: script.id,
+    current_version: script.current_version,
+    versions,
+  });
+});
+
+// 查看某历史版本正文（只读快照）
+app.get('/api/scripts/:id/versions/:version', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const v = getVersionOr404(script.id, req.params.version);
+  res.json({ ...v, is_current: v.version === script.current_version });
+});
+
+// 恢复前预览：把当前提示迁移到该版正文后，已绑定/待确认各有多少（不落库）
+app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const target = getVersionOr404(script.id, req.params.version);
+  if (target.version === script.current_version) {
+    return res.status(400).json({ error: '该版本就是当前版本，无需恢复' });
+  }
+
+  // 仅做一次只读的重定位试算，不改动任何数据；结果与确认恢复时同一套规则
+  const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(script.id);
+  const { results, stats } = relocalize(cues, target.content);
+  const pendingDetails = results
+    .filter((r) => r.status === 'pending')
+    .map((r) => ({
+      cue_id: r.cueId,
+      issue_type: r.issueType,
+      issue_detail: r.issueDetail,
+      candidates: r.candidates || [],
+    }));
+
+  res.json({
+    script_id: script.id,
+    current_version: script.current_version, // 预览时的当前版本号（确认时须原样带回）
+    target_version: target.version,
+    target_created_at: target.created_at,
+    // 确认恢复后正文将保存为该递增新版本号
+    new_version: script.current_version + 1,
+    stats,
+    pending: pendingDetails,
+  });
+});
+
+/**
+ * 确认恢复历史版本：
+ *   - 不覆盖任何历史快照：把目标版本正文保存为递增的新版本（原历史版本原样保留）；
+ *   - 在同一事务内按现有重定位规则更新提示：重复台词无法唯一定位时保持待确认及候选行；
+ *   - 请求必须携带预览时的当前版本号 expectedCurrentVersion；
+ *     若另一窗口已改版（current_version 已推进），返回 409 并要求重新预览，绝不覆盖新内容。
+ */
+app.post('/api/scripts/:id/versions/:version/restore', (req, res) => {
+  const script = getScriptOr404(req.params.id);
+  const target = getVersionOr404(script.id, req.params.version);
+  const expectedCurrentVersion = Number(req.body.expectedCurrentVersion);
+  if (!Number.isInteger(expectedCurrentVersion) || expectedCurrentVersion <= 0) {
+    return res.status(400).json({ error: '缺少预览时的当前版本号 expectedCurrentVersion' });
+  }
+
+  const outcome = db.transaction(() => {
+    // 事务内重新读取当前版本号，挡住并发窗口下基于过期预览的恢复
+    const cur = db.prepare('SELECT current_version, title FROM scripts WHERE id = ?').get(script.id);
+    if (cur.current_version !== expectedCurrentVersion) {
+      throw conflict(
+        `剧本已被其他窗口保存为第 ${cur.current_version} 版（你的预览基于第 ${expectedCurrentVersion} 版），请重新预览后再恢复`
+      );
+    }
+    if (target.version === cur.current_version) {
+      const e = new Error('该版本已是当前版本，无需恢复');
+      e.status = 400;
+      throw e;
+    }
+    return persistNewVersion(script.id, cur.title, target.content);
+  })();
+
+  res.json({
+    ok: true,
+    restored_from_version: target.version,
+    ...outcome,
+  });
 });
 
 // 删除剧本
